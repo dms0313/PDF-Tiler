@@ -18,7 +18,7 @@ UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'converted'
 HISTORY_FILE = 'conversion_history.json'
 DPI = 350  # 300-400 DPI range
-TILE_SIZE = 640  # 640x640 tiles
+TILE_SIZE = 1024  # 1024 tiles
 OVERLAP = 80  # 80 pixel overlap (12.5% of tile size)
 BLANK_THRESHOLD = 0.98  # Consider tile blank if 98% or more is white/uniform
 
