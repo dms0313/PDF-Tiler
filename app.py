@@ -1,6 +1,6 @@
 from flask import Flask, render_template_string, request, jsonify, send_file
 import fitz  # PyMuPDF
-from PIL import Image, ImageStat
+from PIL import Image
 import os
 import json
 from datetime import datetime
@@ -18,8 +18,8 @@ UPLOAD_FOLDER = 'uploads'
 OUTPUT_FOLDER = 'converted'
 HISTORY_FILE = 'conversion_history.json'
 DPI = 350  # 300-400 DPI range
-TILE_SIZE = 1024  # 1024x1024 tiles
-OVERLAP = 128  # 128 pixel overlap (12.5% of tile size)
+TILE_SIZE = 640  # 640x640 tiles
+OVERLAP = 80  # 80 pixel overlap (12.5% of tile size)
 BLANK_THRESHOLD = 0.98  # Consider tile blank if 98% or more is white/uniform
 
 # Create necessary directories
@@ -37,55 +37,48 @@ def save_history(history):
         json.dump(history, f, indent=2)
 
 def is_blank_tile(image, threshold=0.98):
+    """Quickly detect if a tile is blank, empty, or only contains borders.
+
+    The heavy pixel analysis runs on a downscaled version of the image to
+    significantly reduce the processing time while keeping the heuristics
+    accurate enough for tile filtering.
     """
-    Detect if a tile is blank/empty or just contains border frames.
-    Returns True if the tile is considered blank or is just a border.
-    
-    Uses multiple methods to detect blank tiles:
-    1. Check if most pixels are near white
-    2. Check standard deviation (low variance = uniform/blank)
-    3. Check edge detection (no edges = blank)
-    4. Detect border frames (edges only at perimeter)
-    """
-    # Convert to numpy array for faster processing
-    img_array = np.array(image)
-    
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+
+    # Downscale for faster analysis while keeping structure information
+    if max(image.size) > 256:
+        working_image = image.resize((256, 256), Image.BILINEAR)
+    else:
+        working_image = image
+
+    img_array = np.asarray(working_image, dtype=np.uint8)
+
     # Method 1: Check percentage of near-white pixels
-    # Consider pixels with RGB values > 240 as "white"
-    white_pixels = np.all(img_array > 240, axis=2)
-    white_percentage = np.sum(white_pixels) / (image.width * image.height)
-    
+    white_pixels = np.all(img_array >= 245, axis=2)
+    white_percentage = white_pixels.mean()
     if white_percentage > threshold:
         return True
-    
-    # Method 2: Check standard deviation (variance)
-    # Low std dev means uniform color (likely blank)
-    std_dev = np.std(img_array)
-    if std_dev < 5:  # Very low variation
+
+    # Convert to grayscale once for the remaining checks
+    gray_array = np.dot(img_array[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
+
+    # Method 2: Low variance implies blank/uniform tiles
+    if gray_array.std() < 5:
         return True
-    
-    # Method 3: Check for content using edge detection
-    # Convert to grayscale for edge detection
-    gray = image.convert('L')
-    gray_array = np.array(gray)
-    
-    # Simple edge detection using gradient
+
+    # Method 3: Simple edge detection using gradients
     edges_h = np.abs(np.diff(gray_array, axis=0))
     edges_v = np.abs(np.diff(gray_array, axis=1))
-    
-    # Count significant edges (difference > 30)
-    significant_edges = (np.sum(edges_h > 30) + np.sum(edges_v > 30))
-    edge_density = significant_edges / (image.width * image.height)
-    
-    # If very few edges, likely blank
-    if edge_density < 0.001:  # Less than 0.1% of pixels have edges
+    significant_edges = np.count_nonzero(edges_h > 30) + np.count_nonzero(edges_v > 30)
+    edge_density = significant_edges / (gray_array.shape[0] * gray_array.shape[1])
+    if edge_density < 0.001:
         return True
-    
-    # Method 4: Detect border frames
-    # Check if edges are concentrated only at the perimeter (border frame detection)
+
+    # Method 4: Detect border-only frames
     if is_border_frame(gray_array, edges_h, edges_v):
         return True
-    
+
     return False
 
 def is_border_frame(gray_array, edges_h, edges_v):
@@ -179,9 +172,9 @@ def detect_rectangular_border(gray_array, border_thickness):
     
     return False
 
-def tile_image(image, tile_size=1024, overlap=128):
+def tile_image(image, tile_size=640, overlap=80):
     """
-    Tile a large image into 1024x1024 windows with overlap.
+    Tile a large image into 640x640 windows with overlap.
     Returns list of tuples: (tile_image, row, col)
     """
     width, height = image.size
@@ -569,6 +562,41 @@ HTML_TEMPLATE = '''
             color: #666;
             font-size: 0.9em;
         }
+
+        .processing-details {
+            display: none;
+            margin-top: 15px;
+            background: #f7f8ff;
+            border-radius: 10px;
+            padding: 15px;
+            border: 1px solid #e0e4ff;
+        }
+
+        .processing-details h3 {
+            font-size: 0.95em;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .processing-details ul {
+            list-style: none;
+            color: #555;
+        }
+
+        .processing-details li {
+            font-size: 0.9em;
+            margin-bottom: 6px;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        .processing-details li:before {
+            content: "•";
+            position: absolute;
+            left: 6px;
+            color: #764ba2;
+            font-weight: bold;
+        }
         
         .success-message {
             background: #4caf50;
@@ -839,8 +867,8 @@ HTML_TEMPLATE = '''
                 <ul>
                     <li>Resolution: 350 DPI (300-400 DPI range)</li>
                     <li>Format: JPEG (optimized for Roboflow)</li>
-                    <li>Tile size: 1024×1024 pixels</li>
-                    <li>Overlap: 128 pixels between tiles (12.5%)</li>
+                    <li>Tile size: 640×640 pixels</li>
+                    <li>Overlap: 80 pixels between tiles (12.5%)</li>
                     <li>Auto-filter: Blank tiles automatically removed</li>
                     <li>Color space: RGB (alpha channels removed)</li>
                     <li>Powered by PyMuPDF - No external dependencies needed</li>
@@ -860,6 +888,11 @@ HTML_TEMPLATE = '''
                     <div class="progress-fill" id="progressFill">0%</div>
                 </div>
                 <div class="status-text" id="statusText">Processing...</div>
+            </div>
+
+            <div class="processing-details" id="processingDetails">
+                <h3>Processing details</h3>
+                <ul id="processingSteps"></ul>
             </div>
             
             <div class="success-message" id="successMessage"></div>
@@ -888,6 +921,8 @@ HTML_TEMPLATE = '''
         const progressContainer = document.getElementById('progressContainer');
         const progressFill = document.getElementById('progressFill');
         const statusText = document.getElementById('statusText');
+        const processingDetails = document.getElementById('processingDetails');
+        const processingSteps = document.getElementById('processingSteps');
         const successMessage = document.getElementById('successMessage');
         const errorMessage = document.getElementById('errorMessage');
         const historyList = document.getElementById('historyList');
@@ -895,6 +930,43 @@ HTML_TEMPLATE = '''
         const previewImage = document.getElementById('previewImage');
         const previewFilename = document.getElementById('previewFilename');
         const closePreview = document.getElementById('closePreview');
+
+        const statusSteps = [
+            { progress: 0, status: 'Uploading PDF...', detail: 'Uploading your PDF to the server.' },
+            { progress: 15, status: 'Rendering pages...', detail: 'Rendering PDF pages at 350 DPI.' },
+            { progress: 40, status: 'Creating tiles...', detail: 'Cutting each page into 640×640 tiles with overlap.' },
+            { progress: 65, status: 'Filtering blanks...', detail: 'Skipping blank and border-only tiles.' },
+            { progress: 85, status: 'Finalizing files...', detail: 'Preparing download links and previews.' }
+        ];
+        let currentStepIndex = -1;
+
+        function resetProcessingDetails() {
+            currentStepIndex = -1;
+            processingSteps.innerHTML = '';
+            processingDetails.style.display = 'block';
+        }
+
+        function addProcessingDetail(message) {
+            const item = document.createElement('li');
+            item.textContent = message;
+            processingSteps.appendChild(item);
+        }
+
+        function advanceProcessingSteps(progress) {
+            while (currentStepIndex + 1 < statusSteps.length && progress >= statusSteps[currentStepIndex + 1].progress) {
+                currentStepIndex++;
+                const step = statusSteps[currentStepIndex];
+                statusText.textContent = step.status;
+                addProcessingDetail(step.detail);
+            }
+        }
+
+        function updateProgressDisplay(progress) {
+            const clamped = Math.min(progress, 100);
+            progressFill.style.width = clamped + '%';
+            progressFill.textContent = Math.round(clamped) + '%';
+            advanceProcessingSteps(clamped);
+        }
         
         loadHistory();
         
@@ -959,23 +1031,19 @@ HTML_TEMPLATE = '''
         function uploadFile(file) {
             const formData = new FormData();
             formData.append('file', file);
-            
+
             successMessage.style.display = 'none';
             errorMessage.style.display = 'none';
             progressContainer.style.display = 'block';
-            progressFill.style.width = '0%';
-            progressFill.textContent = '0%';
-            statusText.textContent = 'Uploading PDF...';
-            
+            resetProcessingDetails();
+            updateProgressDisplay(0);
+
             let progress = 0;
             const progressInterval = setInterval(() => {
-                progress += 5;
-                if (progress <= 90) {
-                    progressFill.style.width = progress + '%';
-                    progressFill.textContent = progress + '%';
-                }
+                progress = Math.min(progress + 4, 95);
+                updateProgressDisplay(progress);
             }, 200);
-            
+
             fetch('/upload', {
                 method: 'POST',
                 body: formData
@@ -983,17 +1051,18 @@ HTML_TEMPLATE = '''
             .then(response => response.json())
             .then(data => {
                 clearInterval(progressInterval);
-                
+
                 if (data.error) {
                     throw new Error(data.error);
                 }
-                
-                progressFill.style.width = '100%';
-                progressFill.textContent = '100%';
+
+                updateProgressDisplay(100);
                 statusText.textContent = 'Conversion complete!';
-                
+                addProcessingDetail('✅ Conversion finished successfully.');
+
                 setTimeout(() => {
                     progressContainer.style.display = 'none';
+                    processingDetails.style.display = 'none';
                     let message = `Successfully converted ${data.page_count} page(s) into ${data.tile_count} tiles!`;
                     if (data.blank_filtered > 0) {
                         message += ` (${data.blank_filtered} blank tiles filtered)`;
@@ -1005,9 +1074,16 @@ HTML_TEMPLATE = '''
             })
             .catch(error => {
                 clearInterval(progressInterval);
-                progressContainer.style.display = 'none';
+                progressFill.style.width = '100%';
+                progressFill.textContent = 'Error';
+                statusText.textContent = 'Conversion failed';
+                addProcessingDetail(`❌ ${error.message}`);
                 showError('Error: ' + error.message);
                 fileInput.value = '';
+                setTimeout(() => {
+                    progressContainer.style.display = 'none';
+                    processingDetails.style.display = 'none';
+                }, 2000);
             });
         }
         
@@ -1037,7 +1113,7 @@ HTML_TEMPLATE = '''
                         </div>
                     `).join('');
                     
-                    let infoText = `${item.page_count} page(s) • ${item.tile_count} tiles • 1024×1024px • 350 DPI`;
+                    let infoText = `${item.page_count} page(s) • ${item.tile_count} tiles • 640×640px • 350 DPI`;
                     if (item.blank_filtered && item.blank_filtered > 0) {
                         infoText += ` • ${item.blank_filtered} blank tiles filtered`;
                     }
