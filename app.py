@@ -302,8 +302,19 @@ def upload_file():
         preview_id = request.form.get('preview_id')
         selected_pages = json.loads(request.form.get('selected_pages', '[]'))
 
-        if not preview_id or not selected_pages:
-            return jsonify({'error': 'Missing preview ID or selected pages'}), 400
+        if not preview_id:
+            return jsonify({'error': 'Missing preview ID'}), 400
+
+        if not selected_pages:
+            preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+            preview_images = sorted(
+                [f for f in os.listdir(preview_dir) if f.startswith('page_')]
+            ) if os.path.exists(preview_dir) else []
+
+            if not preview_images:
+                return jsonify({'error': 'Missing preview ID or selected pages'}), 400
+
+            selected_pages = list(range(1, len(preview_images) + 1))
 
         original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
         if not os.path.exists(original_pdf_path):
