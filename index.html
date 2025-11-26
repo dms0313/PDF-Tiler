@@ -887,6 +887,11 @@
         window.downloadImage = downloadImage;
 
         async function tilePages(previewId, selectedPages) {
+            if (!previewId || !selectedPages || selectedPages.length === 0) {
+                showMessage('Missing preview or selected pages. Please generate previews and select at least one page.', 'error');
+                return;
+            }
+
             tileBtn.disabled = true;
             tileBtn.innerHTML = '<span class="loading-spinner"></span> Tiling...';
             hideMessage();
@@ -985,6 +990,11 @@
         });
 
         tileBtn.addEventListener('click', () => {
+            if (!currentPreviewId) {
+                showMessage('Generate previews before tiling.', 'error');
+                return;
+            }
+
             const selectedPages = [];
             const checkboxes = previewGrid.querySelectorAll('.page-checkbox:checked');
             checkboxes.forEach(cb => {
