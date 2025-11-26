@@ -8,3 +8,7 @@
  * Restarting with stat
  * Debugger is active!
  * Debugger PIN: 132-491-319
+Traceback (most recent call last):
+  File "/app/app.py", line 1, in <module>
+    from flask import Flask, render_template_string, request, jsonify, send_file
+ModuleNotFoundError: No module named 'flask'
