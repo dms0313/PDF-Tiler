@@ -10,6 +10,7 @@ import io
 import zipfile
 from io import BytesIO
 import numpy as np
+import shutil
 
 app = Flask(__name__)
 
@@ -254,8 +255,8 @@ def pdf_to_images(pdf_path, dpi=300):
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
+@app.route('/preview_pdf', methods=['POST'])
+def preview_pdf():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
     
@@ -265,14 +266,54 @@ def upload_file():
     
     if not file.filename.lower().endswith('.pdf'):
         return jsonify({'error': 'Only PDF files are allowed'}), 400
-    
+
     try:
+        preview_id = str(uuid.uuid4())
+        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+        os.makedirs(preview_dir, exist_ok=True)
+
+        pdf_path = os.path.join(preview_dir, 'original.pdf')
+        file.save(pdf_path)
+
+        # Generate low-res images for preview
+        images = pdf_to_images(pdf_path, dpi=72)
+
+        preview_files = []
+        for i, image in enumerate(images):
+            thumbnail = image.resize((100, 150), Image.LANCZOS)
+            preview_filename = f"page_{i+1}.jpg"
+            preview_path = os.path.join(preview_dir, preview_filename)
+            thumbnail.save(preview_path, 'JPEG', quality=80)
+            preview_files.append(preview_filename)
+
+        return jsonify({
+            'success': True,
+            'preview_id': preview_id,
+            'preview_files': preview_files,
+            'page_count': len(images)
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    try:
+        preview_id = request.form.get('preview_id')
+        selected_pages = json.loads(request.form.get('selected_pages', '[]'))
+
+        if not preview_id or not selected_pages:
+            return jsonify({'error': 'Missing preview ID or selected pages'}), 400
+
+        original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
+        if not os.path.exists(original_pdf_path):
+            return jsonify({'error': 'Original PDF not found'}), 400
+
         # Generate unique ID for this conversion
         conversion_id = str(uuid.uuid4())
         
-        # Save uploaded PDF
-        pdf_path = os.path.join(UPLOAD_FOLDER, f"{conversion_id}.pdf")
-        file.save(pdf_path)
+        # Use the already uploaded PDF
+        pdf_path = original_pdf_path
         
         # Convert PDF to images using PyMuPDF
         images = pdf_to_images(pdf_path, dpi=DPI)
@@ -286,6 +327,10 @@ def upload_file():
         blank_tiles_filtered = 0
         
         for i, image in enumerate(images):
+            page_num = i + 1
+            if page_num not in selected_pages:
+                continue
+
             # Optimize image for Roboflow
             optimized_image = optimize_for_roboflow(image)
             
@@ -299,7 +344,7 @@ def upload_file():
                     blank_tiles_filtered += 1
                     continue  # Skip this tile
                 
-                output_filename = f"page_{i+1}_tile_r{row}_c{col}.jpg"
+                output_filename = f"page_{page_num}_tile_r{row}_c{col}.jpg"
                 output_path = os.path.join(output_dir, output_filename)
                 tile_img.save(output_path, 'JPEG', quality=95, dpi=(DPI, DPI))
                 
@@ -307,7 +352,7 @@ def upload_file():
                     'filename': output_filename,
                     'path': output_path,
                     'size': os.path.getsize(output_path),
-                    'page': i + 1,
+                    'page': page_num,
                     'tile_row': row,
                     'tile_col': col
                 })
@@ -317,9 +362,9 @@ def upload_file():
         history = load_history()
         history_entry = {
             'id': conversion_id,
-            'original_filename': file.filename,
+            'original_filename': "Selected Pages",
             'timestamp': datetime.now().isoformat(),
-            'page_count': len(images),
+            'page_count': len(selected_pages),
             'tile_count': total_tiles,
             'blank_filtered': blank_tiles_filtered,
             'files': converted_files
@@ -327,13 +372,15 @@ def upload_file():
         history.insert(0, history_entry)  # Most recent first
         save_history(history)
         
-        # Clean up uploaded PDF
-        os.remove(pdf_path)
+        # Clean up preview folder
+        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+        if os.path.exists(preview_dir):
+            shutil.rmtree(preview_dir)
         
         return jsonify({
             'success': True,
             'conversion_id': conversion_id,
-            'page_count': len(images),
+            'page_count': len(selected_pages),
             'tile_count': total_tiles,
             'blank_filtered': blank_tiles_filtered,
             'files': converted_files
@@ -346,6 +393,14 @@ def upload_file():
 def get_history():
     history = load_history()
     return jsonify(history)
+
+@app.route('/preview_image/<preview_id>/<filename>')
+def preview_page_image(preview_id, filename):
+    """Serve preview image"""
+    file_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, mimetype='image/jpeg')
+    return jsonify({'error': 'File not found'}), 404
 
 @app.route('/preview/<conversion_id>/<filename>')
 def preview_image(conversion_id, filename):
@@ -405,10 +460,12 @@ def download_zip(conversion_id):
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF to Image Converter - Roboflow Training</title>
+    <title>PDF to PNG Converter - Client-Side</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -417,123 +474,188 @@ HTML_TEMPLATE = '''
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
             padding: 20px;
         }
         
         .container {
-            max-width: 1200px;
-            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 800px;
+            width: 100%;
+            padding: 40px;
         }
         
         h1 {
-            color: white;
+            color: #333;
             text-align: center;
             margin-bottom: 10px;
             font-size: 2.5em;
         }
         
         .subtitle {
-            color: rgba(255, 255, 255, 0.9);
             text-align: center;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }
-        
-        .card {
-            background: white;
-            border-radius: 15px;
-            padding: 30px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
-            margin-bottom: 30px;
-        }
-        
-        .spec-info {
-            background: #f0f4ff;
-            border-left: 4px solid #667eea;
-            padding: 15px;
-            margin-bottom: 20px;
-            border-radius: 5px;
-        }
-        
-        .spec-info h3 {
-            color: #667eea;
-            margin-bottom: 10px;
-            font-size: 1.1em;
-        }
-        
-        .spec-info ul {
-            list-style: none;
             color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
         }
         
-        .spec-info li {
-            margin-bottom: 5px;
-            padding-left: 20px;
-            position: relative;
-        }
-        
-        .spec-info li:before {
-            content: "✓";
-            position: absolute;
-            left: 0;
-            color: #667eea;
-            font-weight: bold;
-        }
-        
-        .no-admin-badge {
-            background: #4caf50;
-            color: white;
-            padding: 8px 15px;
-            border-radius: 20px;
-            font-size: 0.85em;
+        .badge {
             display: inline-block;
-            margin-bottom: 15px;
+            background: #10b981;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
             font-weight: 600;
+            margin-left: 8px;
         }
         
-        .drop-zone {
+        .upload-area {
             border: 3px dashed #667eea;
-            border-radius: 10px;
+            border-radius: 15px;
             padding: 60px 20px;
             text-align: center;
-            transition: all 0.3s ease;
             cursor: pointer;
+            transition: all 0.3s ease;
             background: #f8f9ff;
+            margin-bottom: 30px;
+        }
+
+        .upload-area:hover {
+            background: #f0f2ff;
+            border-color: #764ba2;
         }
         
-        .drop-zone.drag-over {
+        .upload-area.dragover {
             background: #e8ebff;
             border-color: #764ba2;
             transform: scale(1.02);
         }
         
-        .drop-zone-icon {
+        .upload-icon {
             font-size: 4em;
             margin-bottom: 20px;
         }
         
-        .drop-zone-text {
+        .upload-text {
             font-size: 1.2em;
-            color: #667eea;
+            color: #333;
             margin-bottom: 10px;
-            font-weight: 600;
         }
         
-        .drop-zone-subtext {
+        .upload-hint {
+            color: #666;
+            font-size: 0.95em;
+        }
+        
+        input[type="file"] {
+            display: none;
+        }
+        
+        .options {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .option-group {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 0.95em;
+        }
+        
+        select {
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1em;
+            background: white;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+
+        select:hover {
+            border-color: #667eea;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .convert-btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-bottom: 20px;
+        }
+
+        .convert-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .convert-btn:active {
+            transform: translateY(0);
+        }
+        
+        .convert-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .file-info {
+            background: #f0f2ff;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .file-info.show {
+            display: block;
+        }
+
+        .file-name {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .file-details {
             color: #666;
             font-size: 0.9em;
         }
         
-        #fileInput {
+        .progress {
             display: none;
+            margin-bottom: 20px;
         }
         
-        .progress-container {
-            display: none;
-            margin-top: 30px;
+        .progress.show {
+            display: block;
         }
         
         .progress-bar {
@@ -542,12 +664,11 @@ HTML_TEMPLATE = '''
             background: #e0e0e0;
             border-radius: 15px;
             overflow: hidden;
-            margin-bottom: 10px;
         }
         
         .progress-fill {
             height: 100%;
-            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             width: 0%;
             transition: width 0.3s ease;
             display: flex;
@@ -555,621 +676,628 @@ HTML_TEMPLATE = '''
             justify-content: center;
             color: white;
             font-weight: 600;
-        }
-        
-        .status-text {
-            text-align: center;
-            color: #666;
-            font-size: 0.9em;
-        }
-
-        .processing-details {
-            display: none;
-            margin-top: 15px;
-            background: #f7f8ff;
-            border-radius: 10px;
-            padding: 15px;
-            border: 1px solid #e0e4ff;
-        }
-
-        .processing-details h3 {
-            font-size: 0.95em;
-            color: #667eea;
-            margin-bottom: 10px;
-        }
-
-        .processing-details ul {
-            list-style: none;
-            color: #555;
-        }
-
-        .processing-details li {
-            font-size: 0.9em;
-            margin-bottom: 6px;
-            padding-left: 20px;
-            position: relative;
-        }
-
-        .processing-details li:before {
-            content: "•";
-            position: absolute;
-            left: 6px;
-            color: #764ba2;
-            font-weight: bold;
-        }
-        
-        .success-message {
-            background: #4caf50;
-            color: white;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 20px;
-            text-align: center;
-            display: none;
-        }
-        
-        .error-message {
-            background: #f44336;
-            color: white;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 20px;
-            text-align: center;
-            display: none;
-        }
-        
-        .history-section h2 {
-            color: #333;
-            margin-bottom: 20px;
-            font-size: 1.8em;
-        }
-        
-        .history-item {
-            border: 1px solid #e0e0e0;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 15px;
-            transition: all 0.3s ease;
-        }
-        
-        .history-item:hover {
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
-        }
-        
-        .history-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        
-        .history-title {
-            font-weight: 600;
-            color: #333;
-            font-size: 1.1em;
-            flex: 1;
-        }
-        
-        .history-header-right {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .history-date {
-            color: #999;
             font-size: 0.85em;
         }
         
-        .history-info {
-            color: #666;
-            margin-bottom: 15px;
-            font-size: 0.9em;
-        }
-        
-        .file-list {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 10px;
-        }
-        
-        .file-item {
-            background: #f5f5f5;
-            padding: 12px;
-            border-radius: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 0.9em;
-            position: relative;
-            cursor: pointer;
-        }
-        
-        .file-item:hover {
-            background: #e8e8e8;
-        }
-        
-        .hover-preview {
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
-            margin-bottom: 10px;
+        .results {
             display: none;
-            z-index: 1000;
-            pointer-events: none;
         }
         
-        .file-item:hover .hover-preview {
+        .results.show {
             display: block;
         }
         
-        .hover-preview img {
-            max-width: 300px;
-            max-height: 300px;
-            border: 3px solid #667eea;
-            border-radius: 8px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-            background: white;
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            background: #f8f9ff;
+            border-radius: 10px;
+            margin-bottom: 10px;
         }
         
-        .hover-preview-arrow {
-            width: 0;
-            height: 0;
-            border-left: 10px solid transparent;
-            border-right: 10px solid transparent;
-            border-top: 10px solid #667eea;
-            position: absolute;
-            bottom: -10px;
-            left: 50%;
-            transform: translateX(-50%);
+        .result-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .result-preview {
+            width: 60px;
+            height: 60px;
+            border-radius: 8px;
+            object-fit: cover;
+            border: 2px solid #e0e0e0;
+        }
+        
+        .result-details {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .result-name {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 3px;
+        }
+        
+        .result-size {
+            color: #666;
+            font-size: 0.85em;
         }
         
         .download-btn {
+            padding: 10px 20px;
             background: #667eea;
             color: white;
             border: none;
-            padding: 6px 12px;
-            border-radius: 5px;
+            border-radius: 8px;
             cursor: pointer;
-            text-decoration: none;
-            font-size: 0.85em;
-            transition: background 0.3s ease;
+            font-weight: 600;
+            transition: all 0.3s ease;
         }
         
         .download-btn:hover {
             background: #764ba2;
+            transform: translateY(-2px);
         }
         
         .download-all-btn {
-            background: #4caf50;
+            width: 100%;
+            padding: 16px;
+            background: #10b981;
             color: white;
             border: none;
-            padding: 8px 16px;
-            border-radius: 5px;
-            cursor: pointer;
-            text-decoration: none;
-            font-size: 0.9em;
-            transition: background 0.3s ease;
+            border-radius: 10px;
+            font-size: 1.1em;
             font-weight: 600;
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 20px;
         }
         
         .download-all-btn:hover {
-            background: #45a049;
+            background: #059669;
+            transform: translateY(-2px);
         }
         
-        .collapse-toggle {
-            background: none;
-            border: none;
-            color: #667eea;
-            cursor: pointer;
-            font-size: 1.3em;
-            padding: 5px;
-            margin-right: 10px;
-            transition: transform 0.3s ease;
-            font-weight: bold;
-        }
-        
-        .collapse-toggle.collapsed {
-            transform: rotate(-90deg);
-        }
-        
-        .collapsible-content {
-            max-height: 2000px;
-            overflow: hidden;
-            transition: max-height 0.3s ease, opacity 0.3s ease;
-            opacity: 1;
-        }
-        
-        .collapsible-content.collapsed {
-            max-height: 0;
-            opacity: 0;
-        }
-        
-        .image-preview-modal {
+        .message {
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
             display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            z-index: 10000;
-            align-items: center;
-            justify-content: center;
         }
-        
-        .image-preview-modal.active {
-            display: flex;
+
+        .message.show {
+            display: block;
         }
-        
-        .preview-content {
-            position: relative;
-            max-width: 90%;
-            max-height: 90%;
+
+        .message.error {
+            background: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
         }
-        
-        .preview-content img {
-            max-width: 100%;
-            max-height: 85vh;
-            border-radius: 8px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+
+        .message.success {
+            background: #efe;
+            color: #3c3;
+            border: 1px solid #cfc;
         }
-        
-        .preview-close {
-            position: absolute;
-            top: -40px;
-            right: 0;
-            background: white;
-            border: none;
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            font-size: 24px;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: background 0.3s ease;
-        }
-        
-        .preview-close:hover {
-            background: #f0f0f0;
-        }
-        
-        .preview-filename {
+
+        .footer {
             text-align: center;
-            color: white;
-            margin-top: 15px;
+            margin-top: 30px;
+            color: #666;
             font-size: 0.9em;
         }
+
+        .footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
         
-        .preview-icon {
-            margin-right: 5px;
+        @media (max-width: 600px) {
+            .container {
+                padding: 25px;
+            }
+            h1 {
+                font-size: 2em;
+            }
+            .options {
+                grid-template-columns: 1fr;
+            }
+            .upload-area {
+                padding: 40px 15px;
+            }
+        }
+        
+        .loading-spinner {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+        
+        .preview-section {
+            margin-top: 30px;
+        }
+
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .preview-header h3 {
+            color: #333;
+        }
+
+        .select-all-container {
+            display: flex;
+            align-items: center;
+        }
+        
+        .preview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 10px;
+            background: #f8f9ff;
+            border-radius: 10px;
+        }
+
+        .preview-item {
+            position: relative;
+            cursor: pointer;
+        }
+        
+        .preview-item img {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            border: 2px solid #e0e0e0;
+            transition: border-color 0.3s;
+        }
+
+        .preview-item .page-checkbox {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        
+        .preview-item .page-number {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.8em;
+        }
+
+        .preview-item.selected img {
+            border-color: #667eea;
         }
     </style>
 </head>
+
 <body>
     <div class="container">
-        <h1>🖼️ PDF to Image Converter</h1>
-        <p class="subtitle">Convert PDFs to Roboflow-ready training images at 350 DPI</p>
-        
-        <div class="card">
-            <div class="no-admin-badge">✓ No Admin Rights Required - Uses Pure Python</div>
-            
-            <div class="spec-info">
-                <h3>Conversion Specifications</h3>
-                <ul>
-                    <li>Resolution: 350 DPI (300-400 DPI range)</li>
-                    <li>Format: JPEG (optimized for Roboflow)</li>
-                    <li>Tile size: 640×640 pixels</li>
-                    <li>Overlap: 80 pixels between tiles (12.5%)</li>
-                    <li>Auto-filter: Blank tiles automatically removed</li>
-                    <li>Color space: RGB (alpha channels removed)</li>
-                    <li>Powered by PyMuPDF - No external dependencies needed</li>
-                </ul>
-            </div>
-            
-            <div class="drop-zone" id="dropZone">
-                <div class="drop-zone-icon">📄</div>
-                <div class="drop-zone-text">Drag & Drop PDF File Here</div>
-                <div class="drop-zone-subtext">or click to browse</div>
-            </div>
-            
+        <h1>📄 PDF to PNG<span class="badge">No Upload!</span></h1>
+        <p class="subtitle">Convert PDFs to images right in your browser - 100% client-side, no server needed!</p>
+
+        <div class="message" id="message"></div>
+
+        <div class="upload-area" id="uploadArea">
+            <div class="upload-icon">📁</div>
+            <div class="upload-text">Drop your PDF here or click to browse</div>
+            <div class="upload-hint">Maximum file size: 50 MB</div>
             <input type="file" id="fileInput" accept=".pdf">
-            
-            <div class="progress-container" id="progressContainer">
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill">0%</div>
+        </div>
+
+        <div class="file-info" id="fileInfo">
+            <div class="file-name" id="fileName"></div>
+            <div class="file-details" id="fileDetails"></div>
+        </div>
+
+        <div class="options">
+            <div class="option-group">
+                <label for="dpiSelect">Quality (DPI)</label>
+                <select id="dpiSelect">
+                    <option value="1">Low (72 DPI) - Fastest</option>
+                    <option value="1.5">Medium (108 DPI)</option>
+                    <option value="2" selected>High (144 DPI)</option>
+                    <option value="3">Very High (216 DPI)</option>
+                    <option value="4">Maximum (288 DPI) - Slowest</option>
+                </select>
+            </div>
+
+            <div class="option-group">
+                <label for="formatSelect">Output Format</label>
+                <select id="formatSelect">
+                    <option value="png" selected>PNG (Best Quality)</option>
+                    <option value="jpeg">JPEG (Smaller Size)</option>
+                </select>
+            </div>
+        </div>
+
+        <button class="convert-btn" id="convertBtn" disabled>
+            Preview Pages
+        </button>
+
+        <div class="preview-section" id="previewSection" style="display: none;">
+            <div class="preview-header">
+                <h3>Select pages to tile</h3>
+                <div class="select-all-container">
+                    <input type="checkbox" id="selectAllCheckbox" checked>
+                    <label for="selectAllCheckbox">Select All</label>
                 </div>
-                <div class="status-text" id="statusText">Processing...</div>
             </div>
+            <div class="preview-grid" id="previewGrid"></div>
+        </div>
 
-            <div class="processing-details" id="processingDetails">
-                <h3>Processing details</h3>
-                <ul id="processingSteps"></ul>
-            </div>
-            
-            <div class="success-message" id="successMessage"></div>
-            <div class="error-message" id="errorMessage"></div>
-        </div>
-        
-        <div class="card history-section">
-            <h2>📋 Conversion History</h2>
-            <div id="historyList">
-                <p style="text-align: center; color: #999;">No conversions yet</p>
+        <button class="convert-btn" id="tileBtn" style="display: none;">
+            Tile Selected Pages
+        </button>
+
+        <div class="progress" id="progress">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill">0%</div>
             </div>
         </div>
-    </div>
-    
-    <div class="image-preview-modal" id="previewModal">
-        <div class="preview-content">
-            <button class="preview-close" id="closePreview">×</button>
-            <img id="previewImage" src="" alt="Preview">
-            <div class="preview-filename" id="previewFilename"></div>
+
+        <div class="results" id="results">
+            <h3 style="margin-bottom: 15px; color: #333;">Converted Images:</h3>
+            <div id="resultsList"></div>
+            <button class="download-all-btn" id="downloadAllBtn">
+                📦 Download All as ZIP
+            </button>
+        </div>
+
+        <div class="footer">
+            Made with ❤️ using <a href="https://mozilla.github.io/pdf.js/" target="_blank">PDF.js</a>
         </div>
     </div>
-    
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script>
-        const dropZone = document.getElementById('dropZone');
+        // Configure PDF.js worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
-        const progressContainer = document.getElementById('progressContainer');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileDetails = document.getElementById('fileDetails');
+        const convertBtn = document.getElementById('convertBtn');
+        const tileBtn = document.getElementById('tileBtn');
+        const previewSection = document.getElementById('previewSection');
+        const previewGrid = document.getElementById('previewGrid');
+        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
+        const progress = document.getElementById('progress');
         const progressFill = document.getElementById('progressFill');
-        const statusText = document.getElementById('statusText');
-        const processingDetails = document.getElementById('processingDetails');
-        const processingSteps = document.getElementById('processingSteps');
-        const successMessage = document.getElementById('successMessage');
-        const errorMessage = document.getElementById('errorMessage');
-        const historyList = document.getElementById('historyList');
-        const previewModal = document.getElementById('previewModal');
-        const previewImage = document.getElementById('previewImage');
-        const previewFilename = document.getElementById('previewFilename');
-        const closePreview = document.getElementById('closePreview');
+        const results = document.getElementById('results');
+        const resultsList = document.getElementById('resultsList');
+        const downloadAllBtn = document.getElementById('downloadAllBtn');
+        const message = document.getElementById('message');
 
-        const statusSteps = [
-            { progress: 0, status: 'Uploading PDF...', detail: 'Uploading your PDF to the server.' },
-            { progress: 15, status: 'Rendering pages...', detail: 'Rendering PDF pages at 350 DPI.' },
-            { progress: 40, status: 'Creating tiles...', detail: 'Cutting each page into 640×640 tiles with overlap.' },
-            { progress: 65, status: 'Filtering blanks...', detail: 'Skipping blank and border-only tiles.' },
-            { progress: 85, status: 'Finalizing files...', detail: 'Preparing download links and previews.' }
-        ];
-        let currentStepIndex = -1;
+        let currentPDF = null;
+        let convertedImages = [];
 
-        function resetProcessingDetails() {
-            currentStepIndex = -1;
-            processingSteps.innerHTML = '';
-            processingDetails.style.display = 'block';
-        }
+        // Upload area click
+        uploadArea.addEventListener('click', () => fileInput.click());
 
-        function addProcessingDetail(message) {
-            const item = document.createElement('li');
-            item.textContent = message;
-            processingSteps.appendChild(item);
-        }
-
-        function advanceProcessingSteps(progress) {
-            while (currentStepIndex + 1 < statusSteps.length && progress >= statusSteps[currentStepIndex + 1].progress) {
-                currentStepIndex++;
-                const step = statusSteps[currentStepIndex];
-                statusText.textContent = step.status;
-                addProcessingDetail(step.detail);
-            }
-        }
-
-        function updateProgressDisplay(progress) {
-            const clamped = Math.min(progress, 100);
-            progressFill.style.width = clamped + '%';
-            progressFill.textContent = Math.round(clamped) + '%';
-            advanceProcessingSteps(clamped);
-        }
-        
-        loadHistory();
-        
-        closePreview.addEventListener('click', () => {
-            previewModal.classList.remove('active');
-        });
-        
-        previewModal.addEventListener('click', (e) => {
-            if (e.target === previewModal) {
-                previewModal.classList.remove('active');
-            }
-        });
-        
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && previewModal.classList.contains('active')) {
-                previewModal.classList.remove('active');
-            }
-        });
-        
-        function showPreview(imageSrc, filename) {
-            previewImage.src = imageSrc;
-            previewFilename.textContent = filename;
-            previewModal.classList.add('active');
-        }
-        
-        dropZone.addEventListener('click', () => fileInput.click());
-        
-        dropZone.addEventListener('dragover', (e) => {
+        // Drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
-            dropZone.classList.add('drag-over');
+            uploadArea.classList.add('dragover');
         });
-        
-        dropZone.addEventListener('dragleave', () => {
-            dropZone.classList.remove('drag-over');
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
         });
-        
-        dropZone.addEventListener('drop', (e) => {
+
+        uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
-            dropZone.classList.remove('drag-over');
-            
-            const files = e.dataTransfer.files;
-            if (files.length > 0) {
-                handleFile(files[0]);
+            uploadArea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file && file.type === 'application/pdf') {
+                handleFile(file);
+            } else {
+                showMessage('Please drop a PDF file', 'error');
             }
         });
-        
+
+        // File input change
         fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                handleFile(e.target.files[0]);
+            const file = e.target.files[0];
+            if (file) {
+                handleFile(file);
             }
         });
-        
-        function handleFile(file) {
-            if (!file.name.toLowerCase().endsWith('.pdf')) {
-                showError('Please select a PDF file');
+
+        // Handle file
+        async function handleFile(file) {
+            if (file.size > 50 * 1024 * 1024) {
+                showMessage('File too large! Maximum size is 50 MB', 'error');
                 return;
             }
-            
-            uploadFile(file);
+
+            currentPDF = file;
+            fileName.textContent = file.name;
+
+            const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+            fileDetails.textContent = `Size: ${fileSizeMB} MB`;
+
+            fileInfo.classList.add('show');
+            convertBtn.disabled = false;
+            convertBtn.textContent = 'Preview Pages';
+            results.classList.remove('show');
+            previewSection.style.display = 'none';
+            tileBtn.style.display = 'none';
+            hideMessage();
+
+            // Get page count
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+                fileDetails.textContent = `Size: ${fileSizeMB} MB • Pages: ${pdf.numPages}`;
+            } catch (error) {
+                console.error('Error reading PDF:', error);
+            }
         }
-        
-        function uploadFile(file) {
+
+        // Convert button
+        convertBtn.addEventListener('click', () => {
+            if (currentPDF) {
+                previewPDF(currentPDF);
+            }
+        });
+
+        async function previewPDF(file) {
+            convertBtn.disabled = true;
+            convertBtn.innerHTML = '<span class="loading-spinner"></span> Generating previews...';
+            hideMessage();
+
             const formData = new FormData();
             formData.append('file', file);
 
-            successMessage.style.display = 'none';
-            errorMessage.style.display = 'none';
-            progressContainer.style.display = 'block';
-            resetProcessingDetails();
-            updateProgressDisplay(0);
+            try {
+                const response = await fetch('/preview_pdf', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
 
-            let progress = 0;
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                displayPreviews(data.preview_id, data.preview_files);
+                convertBtn.style.display = 'none';
+                tileBtn.style.display = 'block';
+
+            } catch (error) {
+                showMessage('Error generating previews: ' + error.message, 'error');
+                convertBtn.disabled = false;
+                convertBtn.textContent = 'Preview Pages';
+            }
+        }
+
+        function updateProgress(current, total) {
+            const percent = Math.round((current / total) * 100);
+            progressFill.style.width = percent + '%';
+            progressFill.textContent = `${percent}% (${current}/${total})`;
+        }
+
+        function addResultItem(image, pageNum) {
+            const item = document.createElement('div');
+            item.className = 'result-item';
+
+            item.innerHTML = `
+                <div class="result-info">
+                    <img src="${image.url}" class="result-preview" alt="Page ${pageNum}">
+                    <div class="result-details">
+                        <div class="result-name">${image.name}</div>
+                        <div class="result-size">${image.size} KB</div>
+                    </div>
+                </div>
+                <button class="download-btn" onclick="downloadImage(${convertedImages.length - 1})">
+                    Download
+                </button>
+            `;
+
+            resultsList.appendChild(item);
+        }
+
+        function downloadImage(index) {
+            const image = convertedImages[index];
+            const link = document.createElement('a');
+            link.href = image.url;
+            link.download = image.name;
+            link.click();
+        }
+
+        // Download all as ZIP
+        downloadAllBtn.addEventListener('click', async() => {
+            if (convertedImages.length === 0) return;
+
+            downloadAllBtn.innerHTML = '<span class="loading-spinner"></span> Creating ZIP...';
+            downloadAllBtn.disabled = true;
+
+            try {
+                const zip = new JSZip();
+
+                convertedImages.forEach(image => {
+                    zip.file(image.name, image.blob);
+                });
+
+                const zipBlob = await zip.generateAsync({
+                    type: 'blob'
+                });
+                const zipUrl = URL.createObjectURL(zipBlob);
+
+                const baseName = currentPDF.name.replace('.pdf', '');
+                const link = document.createElement('a');
+                link.href = zipUrl;
+                link.download = `${baseName}_converted.zip`;
+                link.click();
+
+                downloadAllBtn.innerHTML = '📦 Download All as ZIP';
+                downloadAllBtn.disabled = false;
+                showMessage('ZIP file downloaded successfully!', 'success');
+
+            } catch (error) {
+                console.error('ZIP creation error:', error);
+                showMessage('Error creating ZIP file', 'error');
+                downloadAllBtn.innerHTML = '📦 Download All as ZIP';
+                downloadAllBtn.disabled = false;
+            }
+        });
+
+        function showMessage(text, type) {
+            message.textContent = text;
+            message.className = 'message show ' + type;
+        }
+
+        function hideMessage() {
+            message.classList.remove('show');
+        }
+
+        // Make downloadImage available globally
+        window.downloadImage = downloadImage;
+
+        async function tilePages(previewId, selectedPages) {
+            tileBtn.disabled = true;
+            tileBtn.innerHTML = '<span class="loading-spinner"></span> Tiling...';
+            hideMessage();
+            progress.classList.add('show');
+            updateProgress(0, 1);
+
+            const formData = new FormData();
+            formData.append('preview_id', previewId);
+            formData.append('selected_pages', JSON.stringify(selectedPages));
+
+            // Simulate progress
+            let simulatedProgress = 0;
             const progressInterval = setInterval(() => {
-                progress = Math.min(progress + 4, 95);
-                updateProgressDisplay(progress);
+                simulatedProgress = Math.min(simulatedProgress + 5, 95);
+                updateProgress(simulatedProgress, 100);
             }, 200);
 
-            fetch('/upload', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
                 clearInterval(progressInterval);
 
                 if (data.error) {
                     throw new Error(data.error);
                 }
 
-                updateProgressDisplay(100);
-                statusText.textContent = 'Conversion complete!';
-                addProcessingDetail('✅ Conversion finished successfully.');
+                updateProgress(100, 100);
+                showMessage(`Successfully tiled ${data.tile_count} images!`, 'success');
+                loadHistory(); // Assuming loadHistory is defined
+                resetUI();
 
-                setTimeout(() => {
-                    progressContainer.style.display = 'none';
-                    processingDetails.style.display = 'none';
-                    let message = `Successfully converted ${data.page_count} page(s) into ${data.tile_count} tiles!`;
-                    if (data.blank_filtered > 0) {
-                        message += ` (${data.blank_filtered} blank tiles filtered)`;
-                    }
-                    showSuccess(message);
-                    loadHistory();
-                    fileInput.value = '';
-                }, 1000);
-            })
-            .catch(error => {
+            } catch (error) {
                 clearInterval(progressInterval);
-                progressFill.style.width = '100%';
-                progressFill.textContent = 'Error';
-                statusText.textContent = 'Conversion failed';
-                addProcessingDetail(`❌ ${error.message}`);
-                showError('Error: ' + error.message);
-                fileInput.value = '';
-                setTimeout(() => {
-                    progressContainer.style.display = 'none';
-                    processingDetails.style.display = 'none';
-                }, 2000);
+                showMessage('Error tiling pages: ' + error.message, 'error');
+                tileBtn.disabled = false;
+                tileBtn.textContent = 'Tile Selected Pages';
+                progress.classList.remove('show');
+            }
+        }
+
+        function resetUI() {
+            fileInfo.classList.remove('show');
+            previewSection.style.display = 'none';
+            tileBtn.style.display = 'none';
+            convertBtn.style.display = 'block';
+            convertBtn.disabled = true;
+            convertBtn.textContent = 'Select a PDF file first';
+            progress.classList.remove('show');
+            fileInput.value = '';
+            currentPDF = null;
+        }
+
+        let currentPreviewId = null;
+
+        function displayPreviews(previewId, files) {
+            currentPreviewId = previewId;
+            previewGrid.innerHTML = '';
+            files.forEach((file, index) => {
+                const pageNum = index + 1;
+                const item = document.createElement('div');
+                item.className = 'preview-item selected';
+                item.dataset.pageNum = pageNum;
+                item.innerHTML = `
+                    <img src="/preview_image/${previewId}/${file}" alt="Page ${pageNum}">
+                    <input type="checkbox" class="page-checkbox" checked>
+                    <div class="page-number">${pageNum}</div>
+                `;
+                previewGrid.appendChild(item);
             });
+
+            previewSection.style.display = 'block';
+            selectAllCheckbox.checked = true;
         }
-        
-        function loadHistory() {
-            fetch('/history')
-            .then(response => response.json())
-            .then(history => {
-                if (history.length === 0) {
-                    historyList.innerHTML = '<p style="text-align: center; color: #999;">No conversions yet</p>';
-                    return;
-                }
-                
-                historyList.innerHTML = history.map(item => {
-                    const date = new Date(item.timestamp);
-                    const dateStr = date.toLocaleString();
-                    
-                    const filesHtml = item.files.map(file => `
-                        <div class="file-item">
-                            <div class="hover-preview">
-                                <img src="/preview/${item.id}/${file.filename}" alt="${file.filename}">
-                                <div class="hover-preview-arrow"></div>
-                            </div>
-                            <span onclick="showPreview('/preview/${item.id}/${file.filename}', '${file.filename}')">
-                                <span class="preview-icon">👁️</span>${file.filename}
-                            </span>
-                            <a href="/download/${item.id}/${file.filename}" class="download-btn" onclick="event.stopPropagation()">Download</a>
-                        </div>
-                    `).join('');
-                    
-                    let infoText = `${item.page_count} page(s) • ${item.tile_count} tiles • 640×640px • 350 DPI`;
-                    if (item.blank_filtered && item.blank_filtered > 0) {
-                        infoText += ` • ${item.blank_filtered} blank tiles filtered`;
-                    }
-                    
-                    return `
-                        <div class="history-item">
-                            <div class="history-header">
-                                <button class="collapse-toggle collapsed" onclick="toggleCollapse(this)">▼</button>
-                                <div class="history-title">${item.original_filename}</div>
-                                <div class="history-header-right">
-                                    <div class="history-date">${dateStr}</div>
-                                    <a href="/download_zip/${item.id}" class="download-all-btn">
-                                        📦 Download All (ZIP)
-                                    </a>
-                                </div>
-                            </div>
-                            <div class="collapsible-content collapsed">
-                                <div class="history-info">
-                                    ${infoText}
-                                </div>
-                                <div class="file-list">
-                                    ${filesHtml}
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                }).join('');
-            })
-            .catch(error => {
-                console.error('Error loading history:', error);
+
+        previewGrid.addEventListener('click', (e) => {
+            const item = e.target.closest('.preview-item');
+            if (item) {
+                const checkbox = item.querySelector('.page-checkbox');
+                checkbox.checked = !checkbox.checked;
+                item.classList.toggle('selected');
+            }
+        });
+
+        selectAllCheckbox.addEventListener('change', (e) => {
+            const isChecked = e.target.checked;
+            const checkboxes = previewGrid.querySelectorAll('.page-checkbox');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = isChecked;
+                checkbox.closest('.preview-item').classList.toggle('selected', isChecked);
             });
-        }
-        
-        function toggleCollapse(button) {
-            const content = button.parentElement.nextElementSibling;
-            button.classList.toggle('collapsed');
-            content.classList.toggle('collapsed');
-        }
-        
-        function showSuccess(message) {
-            successMessage.textContent = message;
-            successMessage.style.display = 'block';
-            setTimeout(() => {
-                successMessage.style.display = 'none';
-            }, 5000);
-        }
-        
-        function showError(message) {
-            errorMessage.textContent = message;
-            errorMessage.style.display = 'block';
-            setTimeout(() => {
-                errorMessage.style.display = 'none';
-            }, 5000);
-        }
+        });
+
+        tileBtn.addEventListener('click', () => {
+            const selectedPages = [];
+            const checkboxes = previewGrid.querySelectorAll('.page-checkbox:checked');
+            checkboxes.forEach(cb => {
+                selectedPages.push(parseInt(cb.closest('.preview-item').dataset.pageNum));
+            });
+
+            if (selectedPages.length === 0) {
+                showMessage('Please select at least one page to tile.', 'error');
+                return;
+            }
+
+            tilePages(currentPreviewId, selectedPages);
+        });
+
     </script>
 </body>
+
 </html>
 '''
 
