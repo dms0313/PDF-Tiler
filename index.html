@@ -367,6 +367,74 @@
                 transform: rotate(360deg);
             }
         }
+
+        .preview-section {
+            margin-top: 30px;
+        }
+
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .preview-header h3 {
+            color: #333;
+        }
+
+        .select-all-container {
+            display: flex;
+            align-items: center;
+        }
+
+        .preview-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+            padding: 10px;
+            background: #f8f9ff;
+            border-radius: 10px;
+        }
+
+        .preview-item {
+            position: relative;
+            cursor: pointer;
+        }
+
+        .preview-item img {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            border: 2px solid #e0e0e0;
+            transition: border-color 0.3s;
+        }
+
+        .preview-item .page-checkbox {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+
+        .preview-item .page-number {
+            position: absolute;
+            bottom: 8px;
+            left: 8px;
+            background: rgba(0, 0, 0, 0.6);
+            color: white;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.8em;
+        }
+
+        .preview-item.selected img {
+            border-color: #667eea;
+        }
     </style>
 </head>
 
@@ -411,7 +479,22 @@
         </div>
 
         <button class="convert-btn" id="convertBtn" disabled>
-            Select a PDF file first
+            Preview Pages
+        </button>
+
+        <div class="preview-section" id="previewSection" style="display: none;">
+            <div class="preview-header">
+                <h3>Select pages to tile</h3>
+                <div class="select-all-container">
+                    <input type="checkbox" id="selectAllCheckbox" checked>
+                    <label for="selectAllCheckbox">Select All</label>
+                </div>
+            </div>
+            <div class="preview-grid" id="previewGrid"></div>
+        </div>
+
+        <button class="convert-btn" id="tileBtn" style="display: none;">
+            Tile Selected Pages
         </button>
 
         <div class="progress" id="progress">
@@ -444,6 +527,10 @@
         const fileName = document.getElementById('fileName');
         const fileDetails = document.getElementById('fileDetails');
         const convertBtn = document.getElementById('convertBtn');
+        const tileBtn = document.getElementById('tileBtn');
+        const previewSection = document.getElementById('previewSection');
+        const previewGrid = document.getElementById('previewGrid');
+        const selectAllCheckbox = document.getElementById('selectAllCheckbox');
         const progress = document.getElementById('progress');
         const progressFill = document.getElementById('progressFill');
         const results = document.getElementById('results');
@@ -501,8 +588,10 @@
 
             fileInfo.classList.add('show');
             convertBtn.disabled = false;
-            convertBtn.textContent = 'Convert to Images';
+            convertBtn.textContent = 'Preview Pages';
             results.classList.remove('show');
+            previewSection.style.display = 'none';
+            tileBtn.style.display = 'none';
             hideMessage();
 
             // Get page count
@@ -516,74 +605,41 @@
         }
 
         // Convert button
-        convertBtn.addEventListener('click', async() => {
-            if (!currentPDF) return;
-
-            convertBtn.disabled = true;
-            convertBtn.innerHTML = '<span class="loading-spinner"></span> Converting...';
-            progress.classList.add('show');
-            results.classList.remove('show');
-            convertedImages = [];
-            hideMessage();
-
-            try {
-                const arrayBuffer = await currentPDF.arrayBuffer();
-                const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
-                const scale = parseFloat(document.getElementById('dpiSelect').value);
-                const format = document.getElementById('formatSelect').value;
-                const totalPages = pdf.numPages;
-
-                resultsList.innerHTML = '';
-
-                for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-                    updateProgress(pageNum, totalPages);
-
-                    const page = await pdf.getPage(pageNum);
-                    const viewport = page.getViewport({
-                        scale: scale
-                    });
-
-                    const canvas = document.createElement('canvas');
-                    const context = canvas.getContext('2d');
-                    canvas.width = viewport.width;
-                    canvas.height = viewport.height;
-
-                    await page.render({
-                        canvasContext: context,
-                        viewport: viewport
-                    }).promise;
-
-                    const blob = await new Promise(resolve => {
-                        canvas.toBlob(resolve, `image/${format}`, 0.95);
-                    });
-
-                    const baseName = currentPDF.name.replace('.pdf', '');
-                    const imageName = `${baseName}_page_${pageNum}.${format}`;
-
-                    convertedImages.push({
-                        name: imageName,
-                        blob: blob,
-                        url: URL.createObjectURL(blob),
-                        size: (blob.size / 1024).toFixed(2)
-                    });
-
-                    addResultItem(convertedImages[convertedImages.length - 1], pageNum);
-                }
-
-                progress.classList.remove('show');
-                results.classList.add('show');
-                convertBtn.disabled = false;
-                convertBtn.textContent = 'Convert Another PDF';
-                showMessage(`Successfully converted ${totalPages} page(s)!`, 'success');
-
-            } catch (error) {
-                console.error('Conversion error:', error);
-                showMessage('Error converting PDF: ' + error.message, 'error');
-                progress.classList.remove('show');
-                convertBtn.disabled = false;
-                convertBtn.textContent = 'Try Again';
+        convertBtn.addEventListener('click', () => {
+            if (currentPDF) {
+                previewPDF(currentPDF);
             }
         });
+
+        async function previewPDF(file) {
+            convertBtn.disabled = true;
+            convertBtn.innerHTML = '<span class="loading-spinner"></span> Generating previews...';
+            hideMessage();
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch('/preview_pdf', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                displayPreviews(data.preview_id, data.preview_files);
+                convertBtn.style.display = 'none';
+                tileBtn.style.display = 'block';
+
+            } catch (error) {
+                showMessage('Error generating previews: ' + error.message, 'error');
+                convertBtn.disabled = false;
+                convertBtn.textContent = 'Preview Pages';
+            }
+        }
 
         function updateProgress(current, total) {
             const percent = Math.round((current / total) * 100);
@@ -667,6 +723,118 @@
 
         // Make downloadImage available globally
         window.downloadImage = downloadImage;
+
+        async function tilePages(previewId, selectedPages) {
+            tileBtn.disabled = true;
+            tileBtn.innerHTML = '<span class="loading-spinner"></span> Tiling...';
+            hideMessage();
+            progress.classList.add('show');
+            updateProgress(0, 1);
+
+            const formData = new FormData();
+            formData.append('preview_id', previewId);
+            formData.append('selected_pages', JSON.stringify(selectedPages));
+
+            // Simulate progress
+            let simulatedProgress = 0;
+            const progressInterval = setInterval(() => {
+                simulatedProgress = Math.min(simulatedProgress + 5, 95);
+                updateProgress(simulatedProgress, 100);
+            }, 200);
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                clearInterval(progressInterval);
+
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+
+                updateProgress(100, 100);
+                showMessage(`Successfully tiled ${data.tile_count} images!`, 'success');
+                loadHistory(); // Assuming loadHistory is defined
+                resetUI();
+
+            } catch (error) {
+                clearInterval(progressInterval);
+                showMessage('Error tiling pages: ' + error.message, 'error');
+                tileBtn.disabled = false;
+                tileBtn.textContent = 'Tile Selected Pages';
+                progress.classList.remove('show');
+            }
+        }
+
+        function resetUI() {
+            fileInfo.classList.remove('show');
+            previewSection.style.display = 'none';
+            tileBtn.style.display = 'none';
+            convertBtn.style.display = 'block';
+            convertBtn.disabled = true;
+            convertBtn.textContent = 'Select a PDF file first';
+            progress.classList.remove('show');
+            fileInput.value = '';
+            currentPDF = null;
+        }
+
+        let currentPreviewId = null;
+
+        function displayPreviews(previewId, files) {
+            currentPreviewId = previewId;
+            previewGrid.innerHTML = '';
+            files.forEach((file, index) => {
+                const pageNum = index + 1;
+                const item = document.createElement('div');
+                item.className = 'preview-item selected';
+                item.dataset.pageNum = pageNum;
+                item.innerHTML = `
+                    <img src="/preview_image/${previewId}/${file}" alt="Page ${pageNum}">
+                    <input type="checkbox" class="page-checkbox" checked>
+                    <div class="page-number">${pageNum}</div>
+                `;
+                previewGrid.appendChild(item);
+            });
+
+            previewSection.style.display = 'block';
+            selectAllCheckbox.checked = true;
+        }
+
+        previewGrid.addEventListener('click', (e) => {
+            const item = e.target.closest('.preview-item');
+            if (item) {
+                const checkbox = item.querySelector('.page-checkbox');
+                checkbox.checked = !checkbox.checked;
+                item.classList.toggle('selected');
+            }
+        });
+
+        selectAllCheckbox.addEventListener('change', (e) => {
+            const isChecked = e.target.checked;
+            const checkboxes = previewGrid.querySelectorAll('.page-checkbox');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = isChecked;
+                checkbox.closest('.preview-item').classList.toggle('selected', isChecked);
+            });
+        });
+
+        tileBtn.addEventListener('click', () => {
+            const selectedPages = [];
+            const checkboxes = previewGrid.querySelectorAll('.page-checkbox:checked');
+            checkboxes.forEach(cb => {
+                selectedPages.push(parseInt(cb.closest('.preview-item').dataset.pageNum));
+            });
+
+            if (selectedPages.length === 0) {
+                showMessage('Please select at least one page to tile.', 'error');
+                return;
+            }
+
+            tilePages(currentPreviewId, selectedPages);
+        });
+
     </script>
 </body>
 

@@ -10,6 +10,7 @@ import io
 import zipfile
 from io import BytesIO
 import numpy as np
+import shutil
 
 app = Flask(__name__)
 
@@ -254,8 +255,8 @@ def pdf_to_images(pdf_path, dpi=300):
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
+@app.route('/preview_pdf', methods=['POST'])
+def preview_pdf():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
     
@@ -265,14 +266,54 @@ def upload_file():
     
     if not file.filename.lower().endswith('.pdf'):
         return jsonify({'error': 'Only PDF files are allowed'}), 400
-    
+
     try:
+        preview_id = str(uuid.uuid4())
+        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+        os.makedirs(preview_dir, exist_ok=True)
+
+        pdf_path = os.path.join(preview_dir, 'original.pdf')
+        file.save(pdf_path)
+
+        # Generate low-res images for preview
+        images = pdf_to_images(pdf_path, dpi=72)
+
+        preview_files = []
+        for i, image in enumerate(images):
+            thumbnail = image.resize((100, 150), Image.LANCZOS)
+            preview_filename = f"page_{i+1}.jpg"
+            preview_path = os.path.join(preview_dir, preview_filename)
+            thumbnail.save(preview_path, 'JPEG', quality=80)
+            preview_files.append(preview_filename)
+
+        return jsonify({
+            'success': True,
+            'preview_id': preview_id,
+            'preview_files': preview_files,
+            'page_count': len(images)
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    try:
+        preview_id = request.form.get('preview_id')
+        selected_pages = json.loads(request.form.get('selected_pages', '[]'))
+
+        if not preview_id or not selected_pages:
+            return jsonify({'error': 'Missing preview ID or selected pages'}), 400
+
+        original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
+        if not os.path.exists(original_pdf_path):
+            return jsonify({'error': 'Original PDF not found'}), 400
+
         # Generate unique ID for this conversion
         conversion_id = str(uuid.uuid4())
         
-        # Save uploaded PDF
-        pdf_path = os.path.join(UPLOAD_FOLDER, f"{conversion_id}.pdf")
-        file.save(pdf_path)
+        # Use the already uploaded PDF
+        pdf_path = original_pdf_path
         
         # Convert PDF to images using PyMuPDF
         images = pdf_to_images(pdf_path, dpi=DPI)
@@ -286,6 +327,10 @@ def upload_file():
         blank_tiles_filtered = 0
         
         for i, image in enumerate(images):
+            page_num = i + 1
+            if page_num not in selected_pages:
+                continue
+
             # Optimize image for Roboflow
             optimized_image = optimize_for_roboflow(image)
             
@@ -299,7 +344,7 @@ def upload_file():
                     blank_tiles_filtered += 1
                     continue  # Skip this tile
                 
-                output_filename = f"page_{i+1}_tile_r{row}_c{col}.jpg"
+                output_filename = f"page_{page_num}_tile_r{row}_c{col}.jpg"
                 output_path = os.path.join(output_dir, output_filename)
                 tile_img.save(output_path, 'JPEG', quality=95, dpi=(DPI, DPI))
                 
@@ -307,7 +352,7 @@ def upload_file():
                     'filename': output_filename,
                     'path': output_path,
                     'size': os.path.getsize(output_path),
-                    'page': i + 1,
+                    'page': page_num,
                     'tile_row': row,
                     'tile_col': col
                 })
@@ -317,9 +362,9 @@ def upload_file():
         history = load_history()
         history_entry = {
             'id': conversion_id,
-            'original_filename': file.filename,
+            'original_filename': "Selected Pages",
             'timestamp': datetime.now().isoformat(),
-            'page_count': len(images),
+            'page_count': len(selected_pages),
             'tile_count': total_tiles,
             'blank_filtered': blank_tiles_filtered,
             'files': converted_files
@@ -327,8 +372,10 @@ def upload_file():
         history.insert(0, history_entry)  # Most recent first
         save_history(history)
         
-        # Clean up uploaded PDF
-        os.remove(pdf_path)
+        # Clean up preview folder
+        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+        if os.path.exists(preview_dir):
+            shutil.rmtree(preview_dir)
         
         return jsonify({
             'success': True,
@@ -346,6 +393,14 @@ def upload_file():
 def get_history():
     history = load_history()
     return jsonify(history)
+
+@app.route('/preview_image/<preview_id>/<filename>')
+def preview_page_image(preview_id, filename):
+    """Serve preview image"""
+    file_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, mimetype='image/jpeg')
+    return jsonify({'error': 'File not found'}), 404
 
 @app.route('/preview/<conversion_id>/<filename>')
 def preview_image(conversion_id, filename):
