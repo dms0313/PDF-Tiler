@@ -166,6 +166,81 @@
             transform: none;
         }
         
+        .queue-section {
+            margin-bottom: 20px;
+        }
+
+        .queue-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+        }
+
+        .queue-list {
+            list-style: none;
+            background: #f8f9ff;
+            border-radius: 10px;
+            padding: 10px;
+            max-height: 180px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            margin: 0 0 12px 0;
+        }
+
+        .queue-empty {
+            color: #777;
+            text-align: center;
+            padding: 12px;
+        }
+
+        .queue-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            background: white;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+            margin-bottom: 8px;
+            gap: 10px;
+        }
+
+        .queue-name {
+            flex: 1;
+            color: #333;
+            font-weight: 600;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .queue-meta {
+            color: #666;
+            font-size: 0.85em;
+        }
+
+        .queue-status {
+            font-size: 0.85em;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+            background: #eef2ff;
+            color: #4f46e5;
+        }
+
+        .queue-status.processing {
+            background: #fff7ed;
+            color: #c2410c;
+        }
+
+        .queue-status.completed {
+            background: #ecfdf3;
+            color: #15803d;
+        }
+
         .file-info {
             background: #f0f2ff;
             padding: 15px;
@@ -449,7 +524,17 @@
             <div class="upload-icon">📁</div>
             <div class="upload-text">Drop your PDF here or click to browse</div>
             <div class="upload-hint">Maximum file size: 50 MB</div>
-            <input type="file" id="fileInput" accept=".pdf">
+            <input type="file" id="fileInput" accept=".pdf" multiple>
+        </div>
+
+        <div class="queue-section">
+            <div class="queue-header">
+                <span>Processing Queue</span>
+                <small id="queueHint" style="color: #666;">Drop or select multiple PDFs</small>
+            </div>
+            <ul class="queue-list" id="queueList">
+                <li class="queue-empty" id="queueEmpty">No files queued</li>
+            </ul>
         </div>
 
         <div class="file-info" id="fileInfo">
@@ -523,6 +608,8 @@
 
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
+        const queueList = document.getElementById('queueList');
+        const queueEmpty = document.getElementById('queueEmpty');
         const fileInfo = document.getElementById('fileInfo');
         const fileName = document.getElementById('fileName');
         const fileDetails = document.getElementById('fileDetails');
@@ -539,6 +626,9 @@
         const message = document.getElementById('message');
 
         let currentPDF = null;
+        let currentPreviewId = null;
+        let taskQueue = [];
+        let currentTaskId = null;
         let convertedImages = [];
 
         // Upload area click
@@ -557,44 +647,79 @@
         uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
             uploadArea.classList.remove('dragover');
-            const file = e.dataTransfer.files[0];
-            if (file && file.type === 'application/pdf') {
-                handleFile(file);
+            const files = Array.from(e.dataTransfer.files).filter(f => f.type === 'application/pdf');
+            if (files.length) {
+                addToQueue(files);
             } else {
-                showMessage('Please drop a PDF file', 'error');
+                showMessage('Please drop PDF files', 'error');
             }
         });
 
         // File input change
         fileInput.addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (file) {
-                handleFile(file);
+            const files = Array.from(e.target.files || []).filter(f => f.type === 'application/pdf');
+            if (files.length) {
+                addToQueue(files);
             }
+            fileInput.value = '';
         });
 
-        // Handle file
-        async function handleFile(file) {
-            if (file.size > 50 * 1024 * 1024) {
-                showMessage('File too large! Maximum size is 50 MB', 'error');
+        function addToQueue(files) {
+            const newTasks = files.map(file => ({
+                id: crypto.randomUUID(),
+                file,
+                status: 'pending'
+            })).filter(task => task.file.size <= 50 * 1024 * 1024);
+
+            const largeFiles = files.filter(file => file.size > 50 * 1024 * 1024);
+            if (largeFiles.length) {
+                showMessage('Some files were skipped because they exceed 50 MB.', 'error');
+            }
+
+            taskQueue = taskQueue.concat(newTasks);
+            updateQueueUI();
+
+            if (!currentTaskId) {
+                startNextTask();
+            }
+        }
+
+        function startNextTask() {
+            const nextTask = taskQueue.find(task => task.status === 'pending');
+            if (!nextTask) {
+                currentTaskId = null;
+                resetUI();
+                showMessage('Queue complete.', 'success');
                 return;
             }
 
+            currentTaskId = nextTask.id;
+            nextTask.status = 'processing';
+            updateQueueUI();
+            prepareFile(nextTask.file);
+        }
+
+        async function prepareFile(file) {
             currentPDF = file;
+            currentPreviewId = null;
             fileName.textContent = file.name;
 
             const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
             fileDetails.textContent = `Size: ${fileSizeMB} MB`;
 
             fileInfo.classList.add('show');
-            convertBtn.disabled = false;
-            convertBtn.textContent = 'Preview Pages';
+            convertBtn.style.display = 'block';
+            convertBtn.disabled = true;
+            convertBtn.textContent = 'Previewing...';
             results.classList.remove('show');
             previewSection.style.display = 'none';
             tileBtn.style.display = 'none';
+            tileBtn.textContent = 'Tile Selected Pages';
+            tileBtn.disabled = false;
+            previewGrid.innerHTML = '';
+            selectAllCheckbox.checked = true;
             hideMessage();
 
-            // Get page count
             try {
                 const arrayBuffer = await file.arrayBuffer();
                 const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
@@ -602,14 +727,49 @@
             } catch (error) {
                 console.error('Error reading PDF:', error);
             }
+
+            previewPDF(file);
         }
 
-        // Convert button
+        function updateQueueUI() {
+            queueList.innerHTML = '';
+            if (taskQueue.length === 0) {
+                queueList.appendChild(queueEmpty);
+                queueEmpty.style.display = 'block';
+                return;
+            }
+
+            queueEmpty.style.display = 'none';
+            taskQueue.forEach(task => {
+                const item = document.createElement('li');
+                item.className = 'queue-item';
+                item.innerHTML = `
+                    <div class="queue-name">${task.file.name}</div>
+                    <div class="queue-meta">${(task.file.size / (1024 * 1024)).toFixed(2)} MB</div>
+                    <div class="queue-status ${task.status}">${task.status === 'pending' ? 'Queued' : task.status === 'processing' ? 'Processing' : task.status === 'completed' ? 'Done' : 'Error'}</div>
+                `;
+                queueList.appendChild(item);
+            });
+        }
+
+        function setCurrentTaskStatus(status) {
+            if (!currentTaskId) return;
+            const task = taskQueue.find(t => t.id === currentTaskId);
+            if (task) {
+                task.status = status;
+                updateQueueUI();
+            }
+        }
+
+        // Convert button (manual retry if needed)
         convertBtn.addEventListener('click', () => {
             if (currentPDF) {
                 previewPDF(currentPDF);
             }
         });
+
+        // Stub for future history loading
+        function loadHistory() {}
 
         async function previewPDF(file) {
             convertBtn.disabled = true;
@@ -638,6 +798,8 @@
                 showMessage('Error generating previews: ' + error.message, 'error');
                 convertBtn.disabled = false;
                 convertBtn.textContent = 'Preview Pages';
+                setCurrentTaskStatus('error');
+                startNextTask();
             }
         }
 
@@ -757,7 +919,9 @@
                 updateProgress(100, 100);
                 showMessage(`Successfully tiled ${data.tile_count} images!`, 'success');
                 loadHistory(); // Assuming loadHistory is defined
+                setCurrentTaskStatus('completed');
                 resetUI();
+                startNextTask();
 
             } catch (error) {
                 clearInterval(progressInterval);
@@ -765,6 +929,8 @@
                 tileBtn.disabled = false;
                 tileBtn.textContent = 'Tile Selected Pages';
                 progress.classList.remove('show');
+                setCurrentTaskStatus('error');
+                startNextTask();
             }
         }
 
@@ -779,8 +945,6 @@
             fileInput.value = '';
             currentPDF = null;
         }
-
-        let currentPreviewId = null;
 
         function displayPreviews(previewId, files) {
             currentPreviewId = previewId;
