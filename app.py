@@ -26,6 +26,7 @@ BLANK_THRESHOLD = 0.98  # Consider tile blank if 98% or more is white/uniform
 # Create necessary directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(OUTPUT_FOLDER, 'uploads'), exist_ok=True)
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -302,30 +303,34 @@ def upload_file():
         preview_id = request.form.get('preview_id')
         selected_pages = json.loads(request.form.get('selected_pages', '[]'))
 
-        if not preview_id:
-            return jsonify({'error': 'Missing preview ID'}), 400
+        # Allow direct uploads without a preview by accepting a PDF file
+        conversion_id = str(uuid.uuid4())
+
+        if preview_id:
+            original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
+            if not os.path.exists(original_pdf_path):
+                return jsonify({'error': 'Original PDF not found'}), 400
+            pdf_path = original_pdf_path
+            temp_upload_dir = None
+        else:
+            uploaded_file = request.files.get('file')
+            if not uploaded_file or uploaded_file.filename == '':
+                return jsonify({'error': 'Missing preview ID'}), 400
+            if not uploaded_file.filename.lower().endswith('.pdf'):
+                return jsonify({'error': 'Only PDF files are allowed'}), 400
+
+            temp_upload_dir = os.path.join(OUTPUT_FOLDER, 'uploads', conversion_id)
+            os.makedirs(temp_upload_dir, exist_ok=True)
+            pdf_path = os.path.join(temp_upload_dir, 'original.pdf')
+            uploaded_file.save(pdf_path)
 
         if not selected_pages:
-            preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
-            preview_images = sorted(
-                [f for f in os.listdir(preview_dir) if f.startswith('page_')]
-            ) if os.path.exists(preview_dir) else []
-
-            if not preview_images:
+            try:
+                with fitz.open(pdf_path) as pdf_document:
+                    selected_pages = list(range(1, pdf_document.page_count + 1))
+            except Exception:
                 return jsonify({'error': 'Missing preview ID or selected pages'}), 400
 
-            selected_pages = list(range(1, len(preview_images) + 1))
-
-        original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
-        if not os.path.exists(original_pdf_path):
-            return jsonify({'error': 'Original PDF not found'}), 400
-
-        # Generate unique ID for this conversion
-        conversion_id = str(uuid.uuid4())
-        
-        # Use the already uploaded PDF
-        pdf_path = original_pdf_path
-        
         # Convert PDF to images using PyMuPDF
         images = pdf_to_images(pdf_path, dpi=DPI)
         
@@ -384,9 +389,12 @@ def upload_file():
         save_history(history)
         
         # Clean up preview folder
-        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
-        if os.path.exists(preview_dir):
-            shutil.rmtree(preview_dir)
+        if preview_id:
+            preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+            if os.path.exists(preview_dir):
+                shutil.rmtree(preview_dir)
+        if temp_upload_dir and os.path.exists(temp_upload_dir):
+            shutil.rmtree(temp_upload_dir)
         
         return jsonify({
             'success': True,
