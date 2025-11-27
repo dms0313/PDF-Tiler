@@ -299,16 +299,31 @@ def preview_pdf():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    temp_upload_dir = None
     try:
         preview_id = request.form.get('preview_id')
         selected_pages = json.loads(request.form.get('selected_pages', '[]'))
 
-        if not preview_id:
-            return jsonify({'error': 'Missing preview ID'}), 400
+        if preview_id:
+            original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
+            if not os.path.exists(original_pdf_path):
+                return jsonify({'error': 'Original PDF not found'}), 400
+        else:
+            # Fallback for direct file uploads (when no preview has been generated)
+            if 'file' not in request.files:
+                return jsonify({'error': 'Missing preview ID or file'}), 400
 
-        original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
-        if not os.path.exists(original_pdf_path):
-            return jsonify({'error': 'Original PDF not found'}), 400
+            uploaded_file = request.files['file']
+            if uploaded_file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+
+            if not uploaded_file.filename.lower().endswith('.pdf'):
+                return jsonify({'error': 'Only PDF files are allowed'}), 400
+
+            temp_upload_dir = os.path.join(OUTPUT_FOLDER, 'uploads', str(uuid.uuid4()))
+            os.makedirs(temp_upload_dir, exist_ok=True)
+            original_pdf_path = os.path.join(temp_upload_dir, 'uploaded.pdf')
+            uploaded_file.save(original_pdf_path)
 
         if not selected_pages:
             try:
@@ -380,14 +395,14 @@ def upload_file():
         history.insert(0, history_entry)  # Most recent first
         save_history(history)
         
-        # Clean up preview folder
+        # Clean up preview folder or temporary uploads
         if preview_id:
             preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
             if os.path.exists(preview_dir):
                 shutil.rmtree(preview_dir)
         if temp_upload_dir and os.path.exists(temp_upload_dir):
             shutil.rmtree(temp_upload_dir)
-        
+
         return jsonify({
             'success': True,
             'conversion_id': conversion_id,
@@ -396,8 +411,10 @@ def upload_file():
             'blank_filtered': blank_tiles_filtered,
             'files': converted_files
         })
-    
+
     except Exception as e:
+        if temp_upload_dir and os.path.exists(temp_upload_dir):
+            shutil.rmtree(temp_upload_dir)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/history')
