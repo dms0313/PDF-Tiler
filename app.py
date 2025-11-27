@@ -26,6 +26,7 @@ BLANK_THRESHOLD = 0.98  # Consider tile blank if 98% or more is white/uniform
 # Create necessary directories
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(OUTPUT_FOLDER, 'uploads'), exist_ok=True)
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -380,9 +381,12 @@ def upload_file():
         save_history(history)
         
         # Clean up preview folder
-        preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
-        if os.path.exists(preview_dir):
-            shutil.rmtree(preview_dir)
+        if preview_id:
+            preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
+            if os.path.exists(preview_dir):
+                shutil.rmtree(preview_dir)
+        if temp_upload_dir and os.path.exists(temp_upload_dir):
+            shutil.rmtree(temp_upload_dir)
         
         return jsonify({
             'success': True,
