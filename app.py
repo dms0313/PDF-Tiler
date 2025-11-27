@@ -305,20 +305,16 @@ def upload_file():
         if not preview_id:
             return jsonify({'error': 'Missing preview ID'}), 400
 
-        if not selected_pages:
-            preview_dir = os.path.join(OUTPUT_FOLDER, 'previews', preview_id)
-            preview_images = sorted(
-                [f for f in os.listdir(preview_dir) if f.startswith('page_')]
-            ) if os.path.exists(preview_dir) else []
-
-            if not preview_images:
-                return jsonify({'error': 'Missing preview ID or selected pages'}), 400
-
-            selected_pages = list(range(1, len(preview_images) + 1))
-
         original_pdf_path = os.path.join(OUTPUT_FOLDER, 'previews', preview_id, 'original.pdf')
         if not os.path.exists(original_pdf_path):
             return jsonify({'error': 'Original PDF not found'}), 400
+
+        if not selected_pages:
+            try:
+                with fitz.open(original_pdf_path) as pdf_document:
+                    selected_pages = list(range(1, pdf_document.page_count + 1))
+            except Exception:
+                return jsonify({'error': 'Missing preview ID or selected pages'}), 400
 
         # Generate unique ID for this conversion
         conversion_id = str(uuid.uuid4())
